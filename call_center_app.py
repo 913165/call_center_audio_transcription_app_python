@@ -5,6 +5,7 @@ import io
 import json
 import os
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from datetime import date
 from typing import Any, Dict, List
 
@@ -14,6 +15,16 @@ import streamlit as st
 from openai import OpenAI
 from wordcloud import WordCloud
 
+from app_theme import (
+    chart_background,
+    file_status_indicator_html,
+    file_status_label_html,
+    render_themed_table,
+    score_cell_style,
+    scroll_queue_table_to_processing,
+    theme_css,
+    wordcloud_colormap,
+)
 from call_center_logic import (
     TOPICS,
     average_score,
@@ -25,96 +36,97 @@ from call_center_logic import (
 )
 
 SUPPORTED_TYPES = ["mp3", "wav", "mp4", "ogg", "flac", "webm", "m4a"]
+OPENAI_TIMEOUT_SEC = 180.0
+FILE_PROCESS_TIMEOUT_SEC = 300.0
 
-st.set_page_config(page_title="OpenAI Audio Analysis", page_icon="🎧", layout="wide")
-
-st.markdown(
-    """
-<style>
-  .stApp { background: linear-gradient(180deg, #04070c 0%, #050912 100%); color: #e8f7f3; }
-  .block-container { padding-top: 1.2rem; }
-  .hero { border: 1px solid #0a8f84; border-radius: 14px; padding: 1rem 1.2rem; background: rgba(6, 20, 24, 0.8); }
-  .badge { display:inline-block; padding:2px 10px; border:1px solid #0d8578; border-radius:999px; color:#40e0c7; font-size:0.78rem; }
-  .kpi-row { border: 1px solid #123942; border-radius: 12px; padding: 0.5rem 0.8rem; background: rgba(4, 17, 22, 0.8); }
-  .turn-agent { color: #45f4d2; }
-  .turn-customer { color: #f6f18f; }
-  .sentiment-card {
-    background: rgba(14, 18, 24, 0.9);
-    border: 1px solid #2a313d;
-    border-top-width: 3px;
-    border-radius: 12px;
-    padding: 0.8rem 0.9rem 0.9rem 0.9rem;
-    margin-bottom: 0.8rem;
-  }
-  .sentiment-file { color: #7f8da0; font-size: 0.72rem; margin-bottom: 0.25rem; }
-  .sentiment-label { font-size: 1.1rem; font-weight: 700; margin-bottom: 0.45rem; }
-  .score-row {
-    display: grid;
-    grid-template-columns: 95px 1fr 28px;
-    align-items: center;
-    gap: 8px;
-    margin: 0.16rem 0;
-    font-size: 0.74rem;
-    color: #c8d2df;
-  }
-  .score-track { height: 5px; border-radius: 999px; background: #2d3442; overflow: hidden; }
-  .score-fill { height: 100%; border-radius: 999px; background: #26d9a6; }
-  .score-value { color: #8b97a8; font-size: 0.72rem; text-align: right; }
-  .topic-row {
-    border: 1px solid #1b3047;
-    border-radius: 11px;
-    background: rgba(8, 14, 25, 0.9);
-    padding: 0.62rem 0.82rem;
-    margin-bottom: 0.42rem;
-  }
-  .topic-row-main {
-    display: grid;
-    grid-template-columns: minmax(180px, 1.4fr) auto minmax(260px, 3fr) auto;
-    align-items: center;
-    gap: 10px;
-  }
-  .topic-file { color: #8da3bd; font-size: 0.85rem; font-family: monospace; }
-  .topic-pill {
-    padding: 2px 10px;
-    border-radius: 8px;
-    font-size: 0.78rem;
-    border: 1px solid;
-    font-weight: 600;
-    white-space: nowrap;
-  }
-  .topic-snippet {
-    color: #9eb2ca;
-    font-size: 0.82rem;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .topic-confidence { color: #6f89a8; font-size: 0.86rem; font-weight: 600; }
-  .breakdown-panel {
-    border: 1px solid #1b3047;
-    border-radius: 11px;
-    background: rgba(8, 14, 25, 0.9);
-    padding: 0.85rem 0.85rem;
-  }
-  .breakdown-title {
-    color: #6f89a8;
-    letter-spacing: 1px;
-    font-size: 0.78rem;
-    font-weight: 700;
-    margin-bottom: 0.7rem;
-    text-transform: uppercase;
-  }
-  .break-row { margin-bottom: 0.45rem; }
-  .break-label { color: #9eb2ca; font-size: 0.9rem; margin-bottom: 0.18rem; }
-  .break-track { height: 3px; border-radius: 999px; background: #1f2d43; overflow: hidden; }
-  .break-fill { height: 100%; border-radius: 999px; }
-</style>
-""",
-    unsafe_allow_html=True,
+st.set_page_config(
+    page_title="Call Center Audio Intelligence",
+    page_icon="🎧",
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
 
 if "results" not in st.session_state:
     st.session_state["results"] = []
+if "appearance" not in st.session_state:
+    st.session_state["appearance"] = "Dark"
+if "queued_files" not in st.session_state:
+    st.session_state["queued_files"] = []
+if "uploader_key" not in st.session_state:
+    st.session_state["uploader_key"] = 0
+if "batch_run_active" not in st.session_state:
+    st.session_state["batch_run_active"] = False
+if "batch_file_index" not in st.session_state:
+    st.session_state["batch_file_index"] = 0
+if "batch_errors" not in st.session_state:
+    st.session_state["batch_errors"] = []
+
+
+class _StoredUpload:
+    """In-memory upload kept in session state so the file_uploader widget can reset."""
+
+    def __init__(self, name: str, data: bytes, mime: str) -> None:
+        self.name = name
+        self._data = data
+        self.type = mime or "audio/mpeg"
+
+    def getvalue(self) -> bytes:
+        return self._data
+
+
+def _queue_uploads(files: List[Any]) -> None:
+    by_name = {item["name"]: item for item in st.session_state["queued_files"]}
+    for f in files:
+        by_name[f.name] = {
+            "name": f.name,
+            "data": f.getvalue(),
+            "type": f.type or "audio/mpeg",
+        }
+    st.session_state["queued_files"] = list(by_name.values())
+
+
+def _queued_upload_objects() -> List[_StoredUpload]:
+    return [
+        _StoredUpload(item["name"], item["data"], item["type"])
+        for item in st.session_state["queued_files"]
+    ]
+
+
+def _sync_file_status(files: List[_StoredUpload]) -> None:
+    names = [f.name for f in files]
+    current = st.session_state.get("file_status", {})
+    st.session_state["file_status"] = {name: current.get(name, "ready") for name in names}
+
+
+def _queue_table_dataframe(files: List[_StoredUpload]) -> pd.DataFrame:
+    statuses = st.session_state.get("file_status", {})
+    rows: List[Dict[str, Any]] = []
+    for sr_no, f in enumerate(files, start=1):
+        fsize = len(f.getvalue())
+        status = statuses.get(f.name, "ready")
+        rows.append(
+            {
+                "Sr.": sr_no,
+                "": file_status_indicator_html(status),
+                "Recording file": f.name,
+                "Estimated duration": format_duration(estimate_duration_seconds(fsize)),
+                "Size": format_size_mb(fsize),
+                "Date": str(date.today()),
+                "Status": file_status_label_html(status),
+                "_status": status,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _render_queue_table(files: List[_StoredUpload], theme: str, *, max_height_px: int = 280) -> None:
+    render_themed_table(
+        _queue_table_dataframe(files),
+        theme,
+        html_columns={"", "Status"},
+        max_height_px=max_height_px,
+        wrap_class="queue-table-scroll",
+    )
 
 
 # ---------- helpers ----------
@@ -127,9 +139,14 @@ def _timestamp(seconds: float) -> str:
     return f"{minutes:02d}:{sec:02d}"
 
 
-def fig_to_bytes(fig: Any) -> bytes:
+def fig_to_bytes(fig: Any, theme: str) -> bytes:
     buf = io.BytesIO()
-    fig.savefig(buf, format="png", bbox_inches="tight", facecolor="#050912")
+    fig.savefig(
+        buf,
+        format="png",
+        bbox_inches="tight",
+        facecolor=chart_background(theme),
+    )
     buf.seek(0)
     return buf.getvalue()
 
@@ -193,6 +210,21 @@ def _analyze_transcript(client: OpenAI, transcript_text: str) -> Dict[str, Any]:
     return normalize_analysis(json.loads(raw))
 
 
+def _create_openai_client(api_key: str) -> OpenAI:
+    return OpenAI(api_key=api_key, timeout=OPENAI_TIMEOUT_SEC, max_retries=2)
+
+
+def _process_file_with_timeout(client: OpenAI, uploaded_file: Any) -> Dict[str, Any]:
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(_process_file, client, uploaded_file)
+        try:
+            return future.result(timeout=FILE_PROCESS_TIMEOUT_SEC)
+        except FuturesTimeoutError as exc:
+            raise TimeoutError(
+                f"Timed out after {int(FILE_PROCESS_TIMEOUT_SEC)}s — skipping to next file."
+            ) from exc
+
+
 def _process_file(client: OpenAI, uploaded_file: Any) -> Dict[str, Any]:
     data = uploaded_file.getvalue()
     file_tuple = (uploaded_file.name, io.BytesIO(data), uploaded_file.type or "audio/mpeg")
@@ -224,16 +256,6 @@ def _process_file(client: OpenAI, uploaded_file: Any) -> Dict[str, Any]:
     }
 
 
-def _badge_color(outcome: str) -> str:
-    mapping = {
-        "resolved": "#00d2a0",
-        "callback": "#ffb020",
-        "escalated": "#b780ff",
-        "unresolved": "#ff4d5e",
-    }
-    return mapping.get(outcome, "#6c7685")
-
-
 def _topic_color(topic: str) -> str:
     topic_colors = {
         "Tech Support": "#21c7ff",
@@ -246,9 +268,91 @@ def _topic_color(topic: str) -> str:
     return topic_colors.get(topic, "#6f89a8")
 
 
+def _render_sentiment_grid(results: List[Dict[str, Any]]) -> None:
+    sentiment_ui = {
+        "positive": {"emoji": "😊", "label": "Positive", "color": "#1dd7a2", "border": "#1dd7a2"},
+        "negative": {"emoji": "😟", "label": "Negative", "color": "#ff5b63", "border": "#ff5b63"},
+        "mixed": {"emoji": "😐", "label": "Mixed", "color": "#f3c343", "border": "#f3c343"},
+    }
+    cards: List[str] = []
+    for item in results:
+        a = item["analysis"]
+        sentiment = a["sentiment"]
+        ui = sentiment_ui.get(sentiment, sentiment_ui["mixed"])
+        pro = int(a["professionalism_score"])
+        emp = int(a["empathy_score"])
+        res = int(a["resolution_score"])
+        cards.append(
+            f"""
+<div class="sentiment-card" style="border-top-color:{ui['border']};">
+  <div class="sentiment-file">{html.escape(item['filename'])}</div>
+  <div class="sentiment-label" style="color:{ui['color']};">{ui['emoji']} {ui['label']}</div>
+  <div class="score-row">
+    <span>Professionalism</span>
+    <div class="score-track"><div class="score-fill" style="width:{pro}%;"></div></div>
+    <span class="score-value">{pro}</span>
+  </div>
+  <div class="score-row">
+    <span>Empathy</span>
+    <div class="score-track"><div class="score-fill" style="width:{emp}%;"></div></div>
+    <span class="score-value">{emp}</span>
+  </div>
+  <div class="score-row">
+    <span>Resolution</span>
+    <div class="score-track"><div class="score-fill" style="width:{res}%;"></div></div>
+    <span class="score-value">{res}</span>
+  </div>
+</div>
+"""
+        )
+    st.markdown(f'<div class="sentiment-grid">{"".join(cards)}</div>', unsafe_allow_html=True)
+
+
+def _render_kpi_strip(items: List[tuple[str, str]]) -> None:
+    cards = "".join(
+        f'<div class="kpi-card"><div class="kpi-value">{value}</div>'
+        f'<div class="kpi-label">{label}</div></div>'
+        for label, value in items
+    )
+    st.markdown(f'<div class="kpi-strip">{cards}</div>', unsafe_allow_html=True)
+
+
+def _render_turn(turn: Dict[str, Any], _theme: str) -> None:
+    speaker = turn["speaker"]
+    role = "agent" if speaker == "Agent" else "customer"
+    css_class = "turn-agent" if speaker == "Agent" else "turn-customer"
+    st.markdown(
+        f"""
+<div class="turn-block {role}">
+  <span class="{css_class}"><strong>{html.escape(speaker)}</strong> [{_timestamp(turn['start'])}]</span><br>
+  <span style="color: inherit;">{html.escape(turn['text'])}</span>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
+
 # ---------- sidebar ----------
 with st.sidebar:
-    st.header("Settings")
+    st.markdown(
+        """
+<div class="sidebar-brand">
+  <p class="sidebar-brand-title">🎧 Call Intelligence</p>
+  <p class="sidebar-brand-sub">Whisper + GPT-4o pipeline</p>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
+    st.radio(
+        "Appearance",
+        options=["Dark", "Light"],
+        horizontal=True,
+        help="Switch between dark and light interface themes.",
+        key="appearance",
+    )
+
+    st.markdown('<p class="section-label">API & filters</p>', unsafe_allow_html=True)
 
     configured_api_key = str(
         st.secrets.get("OPENAI_API_KEY", "") or os.environ.get("OPENAI_API_KEY", "")
@@ -267,88 +371,148 @@ with st.sidebar:
         st.caption("Using API key from configured secrets/environment.")
 
     all_topics = ["All"] + TOPICS
-    selected_topic = st.selectbox("Filter by department/topic", all_topics)
+    selected_topic = st.selectbox("Filter by topic", all_topics)
 
     results_all = st.session_state["results"]
     avg_overall = round(sum(r.get("avg_score", 0) for r in results_all) / max(len(results_all), 1), 1)
     resolved_count = sum(1 for r in results_all if r["analysis"].get("outcome") == "resolved")
     escalated_count = sum(1 for r in results_all if r["analysis"].get("outcome") == "escalated")
 
-    st.markdown("---")
-    st.metric("Total files processed", len(results_all))
+    st.markdown('<p class="section-label">Session summary</p>', unsafe_allow_html=True)
+    st.metric("Files processed", len(results_all))
     st.metric("Resolved", resolved_count)
     st.metric("Escalated", escalated_count)
-    st.metric("Average overall score", f"{avg_overall}")
+    st.metric("Avg. score", f"{avg_overall}")
 
+current_theme = st.session_state["appearance"].lower()
+st.markdown(theme_css(current_theme), unsafe_allow_html=True)
 
 # ---------- header ----------
-st.markdown("## OpenAI Audio Analysis")
-st.caption("Call Center Batch Pipeline - Whisper + GPT-4o")
-
-st.markdown('<div class="hero">', unsafe_allow_html=True)
-uploaded_files = st.file_uploader(
-    "Browse call recordings",
-    type=SUPPORTED_TYPES,
-    accept_multiple_files=True,
+st.markdown(
+    """
+<div class="app-header">
+  <h1 class="app-title">Call Center <span>Audio Intelligence</span></h1>
+  <p class="app-subtitle">Upload recordings, transcribe with Whisper, and score conversations with GPT-4o.</p>
+</div>
+""",
+    unsafe_allow_html=True,
 )
 
-if uploaded_files:
-    st.markdown(f"<span class='badge'>{len(uploaded_files)} files ready</span>", unsafe_allow_html=True)
+st.markdown('<div class="hero"><div class="hero-label">Upload recordings</div>', unsafe_allow_html=True)
+
+new_uploads = st.file_uploader(
+    "Drag and drop call recordings here",
+    type=SUPPORTED_TYPES,
+    accept_multiple_files=True,
+    label_visibility="collapsed",
+    key=f"file_uploader_{st.session_state['uploader_key']}",
+)
+
+if new_uploads:
+    _queue_uploads(new_uploads)
+    st.session_state["uploader_key"] += 1
+    st.rerun()
+
+queued_files = _queued_upload_objects()
+
+if queued_files:
+    badge_col, clear_col = st.columns([4, 1])
+    with badge_col:
+        st.markdown(
+            f"<span class='badge'>{len(queued_files)} file{'s' if len(queued_files) != 1 else ''} queued</span>",
+            unsafe_allow_html=True,
+        )
+    with clear_col:
+        if st.button("Clear all", use_container_width=True):
+            st.session_state["queued_files"] = []
+            st.session_state["file_status"] = {}
+            st.session_state["uploader_key"] += 1
+            st.rerun()
+
 st.markdown("</div>", unsafe_allow_html=True)
 
-# ---------- upload table ----------
-if uploaded_files:
-    table_rows = []
-    total_size = 0
-    for f in uploaded_files:
-        fsize = len(f.getvalue())
-        total_size += fsize
-        table_rows.append(
-            {
-                "Recording file": f.name,
-                "Estimated duration": format_duration(estimate_duration_seconds(fsize)),
-                "Size": format_size_mb(fsize),
-                "Date": str(date.today()),
-                "Status": "Ready",
-            }
-        )
+effective_api_key = api_key or configured_api_key
+batch_active = bool(st.session_state.get("batch_run_active"))
+run_batch = st.button(
+    "Run analysis batch",
+    type="primary",
+    use_container_width=True,
+    disabled=batch_active,
+)
 
-    c1, c2, c3 = st.columns([1, 1, 2])
-    c1.metric("Recordings", len(uploaded_files))
-    c2.metric("Size", format_size_mb(total_size))
-    c3.caption("Whisper transcription + GPT-4o classification and scoring")
-    st.dataframe(pd.DataFrame(table_rows), use_container_width=True, hide_index=True)
+# ---------- upload table with per-file status dots ----------
+if queued_files:
+    _sync_file_status(queued_files)
+    queue_view_slot = st.empty()
 
-# ---------- batch run ----------
-run_batch = st.button("Run Whisper Batch", type="primary", use_container_width=True)
-if run_batch:
-    effective_api_key = api_key or configured_api_key
+    def _draw_queue_view(*, processing: bool = False) -> None:
+        total_size = sum(len(f.getvalue()) for f in queued_files)
+        done_count = sum(1 for s in st.session_state["file_status"].values() if s == "done")
+        with queue_view_slot.container():
+            _render_kpi_strip(
+                [
+                    ("Recordings", str(len(queued_files))),
+                    ("Total size", format_size_mb(total_size)),
+                    ("Done", str(done_count)),
+                    ("Pipeline status", "Processing…" if processing else "Ready to run"),
+                ]
+            )
+            _render_queue_table(queued_files, current_theme)
+            if processing and any(s == "processing" for s in st.session_state["file_status"].values()):
+                scroll_queue_table_to_processing()
+
+    _draw_queue_view(processing=batch_active)
+
+# ---------- batch run (one file per rerun — avoids Streamlit disconnect on long batches) ----------
+if run_batch and not batch_active:
     if not effective_api_key:
         st.error("Please enter your OpenAI API key in the sidebar.")
-    elif not uploaded_files:
+    elif not queued_files:
         st.error("Please upload at least one audio file.")
     else:
-        client = OpenAI(api_key=effective_api_key)
-        progress = st.progress(0)
-        status = st.empty()
-        new_results = []
+        st.session_state["batch_run_active"] = True
+        st.session_state["batch_file_index"] = 0
+        st.session_state["batch_errors"] = []
+        st.session_state["file_status"] = {f.name: "ready" for f in queued_files}
+        st.rerun()
 
-        for idx, uploaded_file in enumerate(uploaded_files, start=1):
-            status.info(f"Processing {uploaded_file.name} ({idx}/{len(uploaded_files)})")
-            with st.spinner(f"Analyzing {uploaded_file.name}..."):
-                try:
-                    result = _process_file(client, uploaded_file)
-                    new_results.append(result)
-                except Exception as exc:
-                    st.error(f"{uploaded_file.name}: {exc}")
-            progress.progress(idx / len(uploaded_files))
+if batch_active and queued_files and effective_api_key:
+    total_files = len(queued_files)
+    idx = int(st.session_state["batch_file_index"])
 
-        merged = {r["filename"]: r for r in st.session_state["results"]}
-        for item in new_results:
-            merged[item["filename"]] = item
-        st.session_state["results"] = list(merged.values())
-        status.success("Batch completed.")
+    if idx < total_files:
+        uploaded_file = queued_files[idx]
+        label = f"{uploaded_file.name} ({idx + 1}/{total_files})"
+        st.session_state["file_status"][uploaded_file.name] = "processing"
+        st.progress(max(0.0, idx / total_files), text=label)
+        _draw_queue_view(processing=True)
 
+        try:
+            client = _create_openai_client(effective_api_key)
+            result = _process_file_with_timeout(client, uploaded_file)
+            merged = {r["filename"]: r for r in st.session_state["results"]}
+            merged[result["filename"]] = result
+            st.session_state["results"] = list(merged.values())
+            st.session_state["file_status"][uploaded_file.name] = "done"
+        except Exception as exc:
+            st.session_state["batch_errors"].append((uploaded_file.name, str(exc)))
+            st.session_state["file_status"][uploaded_file.name] = "error"
+
+        st.session_state["batch_file_index"] = idx + 1
+        st.rerun()
+
+    st.session_state["batch_run_active"] = False
+    done_count = sum(1 for s in st.session_state["file_status"].values() if s == "done")
+    st.progress(1.0, text=f"Completed {done_count}/{total_files} files")
+    _draw_queue_view(processing=False)
+
+    batch_errors = list(st.session_state.get("batch_errors", []))
+    if batch_errors:
+        for filename, message in batch_errors:
+            st.error(f"{filename}: {message}")
+        st.warning(f"Batch finished with {len(batch_errors)} error(s). {done_count} file(s) succeeded.")
+    else:
+        st.success(f"Batch completed — {done_count} file(s) analyzed.")
 
 # ---------- results ----------
 results = st.session_state["results"]
@@ -357,75 +521,34 @@ if selected_topic != "All":
 
 if results:
     st.markdown("---")
-    st.subheader("Analysis Results")
+    st.subheader("Analysis results")
 
     outcome_counts = Counter(r["analysis"].get("outcome", "unresolved") for r in results)
-    oc1, oc2, oc3, oc4 = st.columns(4)
-    oc1.metric("Resolved", outcome_counts.get("resolved", 0))
-    oc2.metric("Callback", outcome_counts.get("callback", 0))
-    oc3.metric("Escalated", outcome_counts.get("escalated", 0))
-    oc4.metric("Unresolved", outcome_counts.get("unresolved", 0))
+    _render_kpi_strip(
+        [
+            ("Resolved", str(outcome_counts.get("resolved", 0))),
+            ("Callback", str(outcome_counts.get("callback", 0))),
+            ("Escalated", str(outcome_counts.get("escalated", 0))),
+            ("Unresolved", str(outcome_counts.get("unresolved", 0))),
+        ]
+    )
 
     t1, t2, t3, t4, t5, t6 = st.tabs(
         [
-            "😊 Sentiment",
-            "🏷️ Topic Classification",
-            "🎭 Speaker Diarization",
-            "🧑‍💼 Agent Performance",
-            "💬 Key Phrases",
-            "📄 Transcripts",
+            "Sentiment",
+            "Topics",
+            "Speakers",
+            "Agent performance",
+            "Key phrases",
+            "Transcripts",
         ]
     )
 
     with t1:
-        sentiment_ui = {
-            "positive": {"emoji": "😊", "label": "Positive", "color": "#1dd7a2", "border": "#1dd7a2"},
-            "negative": {"emoji": "😟", "label": "Negative", "color": "#ff5b63", "border": "#ff5b63"},
-            "mixed": {"emoji": "😐", "label": "Mixed", "color": "#f3c343", "border": "#f3c343"},
-        }
-
-        for start in range(0, len(results), 2):
-            row_items = results[start : start + 2]
-            columns = st.columns(2)
-            for idx, item in enumerate(row_items):
-                a = item["analysis"]
-                sentiment = a["sentiment"]
-                ui = sentiment_ui.get(sentiment, sentiment_ui["mixed"])
-
-                pro = int(a["professionalism_score"])
-                emp = int(a["empathy_score"])
-                res = int(a["resolution_score"])
-
-                with columns[idx]:
-                    st.markdown(
-                        f"""
-<div class="sentiment-card" style="border-top-color:{ui['border']};">
-  <div class="sentiment-file">{item['filename']}</div>
-  <div class="sentiment-label" style="color:{ui['color']};">{ui['emoji']} {ui['label']}</div>
-
-  <div class="score-row">
-    <span>Professionalism</span>
-    <div class="score-track"><div class="score-fill" style="width:{pro}%;"></div></div>
-    <span class="score-value">{pro}</span>
-  </div>
-  <div class="score-row">
-    <span>Empathy</span>
-    <div class="score-track"><div class="score-fill" style="width:{emp}%;"></div></div>
-    <span class="score-value">{emp}</span>
-  </div>
-  <div class="score-row">
-    <span>Resolution</span>
-    <div class="score-track"><div class="score-fill" style="width:{res}%;"></div></div>
-    <span class="score-value">{res}</span>
-  </div>
-</div>
-""",
-                        unsafe_allow_html=True,
-                    )
-            st.markdown("---")
+        _render_sentiment_grid(results)
 
     with t2:
-        left_col, right_col = st.columns([5, 1])
+        left_col, right_col = st.columns([6, 1])
 
         with left_col:
             for item in results:
@@ -455,7 +578,7 @@ if results:
             total = max(1, sum(topic_counts.values()))
 
             st.markdown('<div class="breakdown-panel">', unsafe_allow_html=True)
-            st.markdown('<div class="breakdown-title">Topic Breakdown</div>', unsafe_allow_html=True)
+            st.markdown('<div class="breakdown-title">Topic breakdown</div>', unsafe_allow_html=True)
 
             for topic in TOPICS:
                 count = topic_counts.get(topic, 0)
@@ -464,14 +587,14 @@ if results:
                 st.markdown(
                     f"""
 <div class="break-row">
-  <div class="break-label">{html.escape(topic)}</div>
+  <div class="break-label"><span>{html.escape(topic)}</span><span>{count}</span></div>
   <div class="break-track"><div class="break-fill" style="width:{pct}%; background:{color};"></div></div>
 </div>
 """,
                     unsafe_allow_html=True,
                 )
 
-            st.markdown('</div>', unsafe_allow_html=True)
+            st.markdown("</div>", unsafe_allow_html=True)
 
     with t3:
         for item in results:
@@ -480,12 +603,7 @@ if results:
                 st.info("No segments available.")
                 continue
             for turn in item["turns"]:
-                speaker = turn["speaker"]
-                css_class = "turn-agent" if speaker == "Agent" else "turn-customer"
-                st.markdown(
-                    f"<span class='{css_class}'><strong>{speaker}</strong> [{_timestamp(turn['start'])}]</span>: {turn['text']}",
-                    unsafe_allow_html=True,
-                )
+                _render_turn(turn, current_theme)
             st.markdown("---")
 
     with t4:
@@ -495,7 +613,6 @@ if results:
             perf_rows.append(
                 {
                     "File": item["filename"],
-                    "Agent": item["filename"],
                     "Professionalism": a["professionalism_score"],
                     "Empathy": a["empathy_score"],
                     "Resolution": a["resolution_score"],
@@ -508,13 +625,14 @@ if results:
         df = pd.DataFrame(perf_rows)
 
         def avg_style(v: float) -> str:
-            if v >= 85:
-                return "background-color: #143a2f; color: #9ef3cf;"
-            if v >= 70:
-                return "background-color: #3d3214; color: #ffe291;"
-            return "background-color: #421d22; color: #ffadad;"
+            return score_cell_style(current_theme, float(v))
 
-        st.dataframe(df.style.map(avg_style, subset=["Average Score"]), use_container_width=True, hide_index=True)
+        render_themed_table(
+            df,
+            current_theme,
+            cell_style={"Average Score": avg_style},
+            max_height_px=480,
+        )
 
     with t5:
         all_phrases: List[str] = []
@@ -522,32 +640,43 @@ if results:
             all_phrases.extend(item["analysis"].get("key_phrases", []))
 
         if all_phrases:
-            wc = WordCloud(width=1200, height=400, background_color="#050912", colormap="viridis").generate(
-                " ".join(all_phrases)
-            )
+            wc = WordCloud(
+                width=1200,
+                height=400,
+                background_color=chart_background(current_theme),
+                colormap=wordcloud_colormap(current_theme),
+            ).generate(" ".join(all_phrases))
             fig, ax = plt.subplots(figsize=(12, 4))
+            fig.patch.set_facecolor(chart_background(current_theme))
+            ax.set_facecolor(chart_background(current_theme))
             ax.imshow(wc, interpolation="bilinear")
             ax.axis("off")
-            st.image(fig_to_bytes(fig), use_container_width=True)
+            st.image(fig_to_bytes(fig, current_theme), use_container_width=True)
             plt.close(fig)
         else:
             st.info("No key phrases yet.")
 
         st.markdown("#### Per-file key phrases")
         for item in results:
-            st.write(f"**{item['filename']}**: {', '.join(item['analysis'].get('key_phrases', []))}")
+            phrases = item["analysis"].get("key_phrases", [])
+            st.write(f"**{item['filename']}**: {', '.join(phrases) if phrases else '—'}")
 
     with t6:
         picked = st.selectbox("Select a file", [r["filename"] for r in results])
         selected = next((r for r in results if r["filename"] == picked), None)
         if selected:
-            for turn in selected["turns"]:
-                color = "#43f0c8" if turn["speaker"] == "Agent" else "#f8e86f"
-                st.markdown(
-                    f"<p><span style='color:{color};font-weight:700'>{turn['speaker']} [{_timestamp(turn['start'])}]</span><br>{turn['text']}</p>",
-                    unsafe_allow_html=True,
-                )
-            if not selected["turns"]:
+            if selected["turns"]:
+                for turn in selected["turns"]:
+                    _render_turn(turn, current_theme)
+            else:
                 st.write(selected["transcript"])
 else:
-    st.info("No processed results yet. Upload files and click 'Run Whisper Batch'.")
+    st.markdown(
+        """
+<div class="empty-hint">
+  <strong>No results yet</strong>
+  Upload call recordings above, then click <em>Run analysis batch</em> to transcribe and score them.
+</div>
+""",
+        unsafe_allow_html=True,
+    )
