@@ -16,12 +16,12 @@ from openai import OpenAI
 from wordcloud import WordCloud
 
 from app_theme import (
+    audio_element_id,
     chart_background,
-    file_status_indicator_html,
-    file_status_label_html,
+    render_audio_play_component,
+    render_queue_table_component,
     render_themed_table,
     score_cell_style,
-    scroll_queue_table_to_processing,
     theme_css,
     wordcloud_colormap,
 )
@@ -92,41 +92,42 @@ def _queued_upload_objects() -> List[_StoredUpload]:
     ]
 
 
+def _audio_for_filename(filename: str) -> tuple[bytes, str] | None:
+    for item in st.session_state.get("queued_files", []):
+        if item["name"] == filename:
+            return item["data"], item.get("type") or "audio/mpeg"
+    for result in st.session_state.get("results", []):
+        if result["filename"] == filename:
+            data = result.get("audio_data")
+            if data is not None:
+                return data, result.get("audio_type") or "audio/mpeg"
+    return None
+
+
 def _sync_file_status(files: List[_StoredUpload]) -> None:
     names = [f.name for f in files]
     current = st.session_state.get("file_status", {})
     st.session_state["file_status"] = {name: current.get(name, "ready") for name in names}
 
 
-def _queue_table_dataframe(files: List[_StoredUpload]) -> pd.DataFrame:
+def _render_queue_table(files: List[_StoredUpload], theme: str, *, max_height_px: int = 280) -> None:
     statuses = st.session_state.get("file_status", {})
     rows: List[Dict[str, Any]] = []
     for sr_no, f in enumerate(files, start=1):
         fsize = len(f.getvalue())
-        status = statuses.get(f.name, "ready")
         rows.append(
             {
-                "Sr.": sr_no,
-                "": file_status_indicator_html(status),
-                "Recording file": f.name,
-                "Estimated duration": format_duration(estimate_duration_seconds(fsize)),
-                "Size": format_size_mb(fsize),
-                "Date": str(date.today()),
-                "Status": file_status_label_html(status),
-                "_status": status,
+                "sr": sr_no,
+                "name": f.name,
+                "data": f.getvalue(),
+                "mime": f.type or "audio/mpeg",
+                "duration": format_duration(estimate_duration_seconds(fsize)),
+                "size": format_size_mb(fsize),
+                "date": str(date.today()),
+                "status": statuses.get(f.name, "ready"),
             }
         )
-    return pd.DataFrame(rows)
-
-
-def _render_queue_table(files: List[_StoredUpload], theme: str, *, max_height_px: int = 280) -> None:
-    render_themed_table(
-        _queue_table_dataframe(files),
-        theme,
-        html_columns={"", "Status"},
-        max_height_px=max_height_px,
-        wrap_class="queue-table-scroll",
-    )
+    render_queue_table_component(rows, theme, max_height_px=max_height_px)
 
 
 # ---------- helpers ----------
@@ -248,6 +249,8 @@ def _process_file(client: OpenAI, uploaded_file: Any) -> Dict[str, Any]:
         "estimated_duration": format_duration(estimate_duration_seconds(len(data))),
         "status": "DONE",
         "date": str(date.today()),
+        "audio_data": data,
+        "audio_type": uploaded_file.type or "audio/mpeg",
         "transcript": transcript_text,
         "segments": segments,
         "turns": turns,
@@ -458,8 +461,6 @@ if queued_files:
                 ]
             )
             _render_queue_table(queued_files, current_theme)
-            if processing and any(s == "processing" for s in st.session_state["file_status"].values()):
-                scroll_queue_table_to_processing()
 
     _draw_queue_view(processing=batch_active)
 
@@ -665,6 +666,14 @@ if results:
         picked = st.selectbox("Select a file", [r["filename"] for r in results])
         selected = next((r for r in results if r["filename"] == picked), None)
         if selected:
+            audio_src = _audio_for_filename(selected["filename"])
+            if audio_src:
+                data, mime = audio_src
+                aid = audio_element_id("transcript", selected["filename"])
+                st.caption(f"Recording: {selected['filename']}")
+                render_audio_play_component(data, mime, aid, current_theme)
+            else:
+                st.caption("Audio not available for this file (re-upload to enable playback).")
             if selected["turns"]:
                 for turn in selected["turns"]:
                     _render_turn(turn, current_theme)

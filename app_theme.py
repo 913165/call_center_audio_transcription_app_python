@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import html as html_module
+import re
 from typing import Any, Callable, Dict, Optional
+
+MAX_INLINE_AUDIO_BYTES = 8 * 1024 * 1024
 
 import pandas as pd
 import streamlit as st
@@ -960,6 +965,70 @@ table.data-table td.col-indicator {{
   padding-left: 0.25rem;
   padding-right: 0.25rem;
 }}
+
+table.data-table th.col-play,
+table.data-table td.col-play {{
+  width: 40px;
+  text-align: center;
+  padding-left: 0.35rem;
+  padding-right: 0.35rem;
+}}
+
+.audio-play-cell {{
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}}
+
+.audio-play-cell audio {{
+  display: none;
+}}
+
+.audio-play-btn {{
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 1px solid {t['border']};
+  border-radius: 50%;
+  background: {t['accent_soft']};
+  color: {t['accent']};
+  font-size: 0.72rem;
+  line-height: 1;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}}
+
+.audio-play-btn:hover {{
+  background: {t['accent']};
+  color: {t['uploader_btn_text']};
+  border-color: {t['accent']};
+}}
+
+.audio-play-btn--disabled {{
+  opacity: 0.35;
+  cursor: not-allowed;
+  pointer-events: none;
+}}
+
+.transcript-audio-bar {{
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-bottom: 1rem;
+  padding: 0.65rem 0.85rem;
+  border: 1px solid {t['border_soft']};
+  border-radius: 12px;
+  background: {t['surface_alt']};
+}}
+
+.transcript-audio-label {{
+  color: {t['text_muted']};
+  font-size: 0.88rem;
+  word-break: break-all;
+}}
 """
     return f"<style>{rules}</style>"
 
@@ -978,6 +1047,84 @@ def file_status_label_html(status: str) -> str:
         "error": "status-text-error",
     }.get(status, "status-text-ready")
     return f'<span class="{css_class}">{html_module.escape(label)}</span>'
+
+
+def audio_element_id(prefix: str, filename: str, index: int = 0) -> str:
+    digest = hashlib.md5(filename.encode("utf-8"), usedforsecurity=False).hexdigest()[:10]
+    safe_prefix = re.sub(r"[^a-zA-Z0-9_-]", "_", prefix)[:12]
+    return f"{safe_prefix}-{index}-{digest}"
+
+
+_AUDIO_TOGGLE_SCRIPT = """
+<script>
+function toggleCallAudio(btn) {
+  const audioId = btn.getAttribute("data-audio-id");
+  const a = document.getElementById(audioId);
+  if (!a) return;
+  const playIcon = btn.getAttribute("data-play-icon") || "▶";
+  const pauseIcon = btn.getAttribute("data-pause-icon") || "⏸";
+  if (a.paused || a.ended) {
+    document.querySelectorAll("audio").forEach(function (x) {
+      if (x === a) return;
+      x.pause();
+      const otherBtn = document.querySelector('[data-audio-id="' + x.id + '"]');
+      if (otherBtn) {
+        otherBtn.textContent = playIcon;
+        otherBtn.title = "Play recording";
+        otherBtn.classList.remove("is-playing");
+      }
+    });
+    a.play().catch(function () {});
+    btn.textContent = pauseIcon;
+    btn.title = "Pause";
+    btn.classList.add("is-playing");
+  } else {
+    a.pause();
+    btn.textContent = playIcon;
+    btn.title = "Play recording";
+    btn.classList.remove("is-playing");
+  }
+}
+document.addEventListener("ended", function (e) {
+  if (!e.target || e.target.tagName !== "AUDIO") return;
+  const btn = document.querySelector('[data-audio-id="' + e.target.id + '"]');
+  if (!btn) return;
+  btn.textContent = btn.getAttribute("data-play-icon") || "▶";
+  btn.title = "Play recording";
+  btn.classList.remove("is-playing");
+}, true);
+</script>
+"""
+
+
+def audio_play_button_html(
+    element_id: str,
+    data: bytes,
+    mime: str = "audio/mpeg",
+    *,
+    max_bytes: int = MAX_INLINE_AUDIO_BYTES,
+) -> str:
+    """Inline play/pause control for queue table (used inside components.html)."""
+    safe_id = re.sub(r"[^a-zA-Z0-9_-]", "_", element_id)
+    audio_dom_id = f"aud-{safe_id}"
+    if len(data) > max_bytes:
+        return (
+            '<span class="audio-play-cell">'
+            '<span class="audio-play-btn audio-play-btn--disabled" '
+            'title="File too large for inline preview (over 8 MB)">▶</span>'
+            "</span>"
+        )
+    b64 = base64.b64encode(data).decode("ascii")
+    safe_mime = html_module.escape(mime or "audio/mpeg")
+    return (
+        f'<span class="audio-play-cell">'
+        f'<audio id="{audio_dom_id}" preload="none" '
+        f'src="data:{safe_mime};base64,{b64}"></audio>'
+        f'<button type="button" class="audio-play-btn" data-audio-id="{audio_dom_id}" '
+        f'data-play-icon="▶" data-pause-icon="⏸" title="Play recording" '
+        f'onclick="toggleCallAudio(this)">▶</button>'
+        f"</span>"
+    )
 
 
 def file_status_indicator_html(status: str) -> str:
@@ -999,25 +1146,213 @@ def file_status_indicator_html(status: str) -> str:
     )
 
 
-def scroll_queue_table_to_processing() -> None:
-    """Keep the actively processing row visible inside the scrollable queue table."""
+def _queue_iframe_css(t: Dict[str, str]) -> str:
+    return f"""
+body {{
+  margin: 0;
+  font-family: "Source Sans Pro", sans-serif;
+  background: {t['dataframe_bg']};
+  color: {t['text_muted']};
+}}
+.data-table-wrap.queue-table-scroll {{
+  max-height: inherit;
+  overflow-y: auto;
+  overflow-x: auto;
+  border: 1px solid {t['border_soft']};
+  border-radius: 12px;
+  background: {t['dataframe_bg']};
+}}
+table.data-table {{
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.84rem;
+}}
+table.data-table thead {{
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}}
+table.data-table th {{
+  background: {t['dataframe_header']};
+  color: {t['text']};
+  font-weight: 700;
+  text-align: left;
+  padding: 0.65rem 0.85rem;
+  border-bottom: 1px solid {t['border']};
+  white-space: nowrap;
+}}
+table.data-table td {{
+  color: {t['text_muted']};
+  padding: 0.55rem 0.85rem;
+  border-bottom: 1px solid {t['border_soft']};
+}}
+table.data-table tbody tr:hover td {{
+  background: {t['surface_alt']};
+  color: {t['text']};
+}}
+table.data-table tbody tr.row-processing td {{
+  background: {t['accent_soft']} !important;
+  color: {t['text']} !important;
+}}
+table.data-table th.col-sr, table.data-table td.col-sr {{
+  width: 42px; text-align: center; color: {t['text_faint']}; font-weight: 600;
+}}
+table.data-table th.col-play, table.data-table td.col-play {{
+  width: 40px; text-align: center;
+}}
+table.data-table th.col-indicator, table.data-table td.col-indicator {{
+  width: 36px; text-align: center;
+}}
+.status-text-ready {{ color: {t['text_faint']}; }}
+.status-text-processing {{ color: {t['accent']}; font-weight: 700; }}
+.status-text-done {{ color: #22c55e; font-weight: 700; }}
+.status-text-error {{ color: #ef4444; font-weight: 700; }}
+.status-dot {{ display: inline-block; width: 11px; height: 11px; border-radius: 50%; }}
+.status-ready {{ background: {t['text_faint']}; opacity: 0.45; }}
+.status-spin {{
+  border: 2px solid {t['accent']}; border-top-color: transparent; background: transparent;
+  animation: spin 0.75s linear infinite;
+}}
+.status-done {{ background: #22c55e; }}
+.status-error {{ background: #ef4444; }}
+@keyframes spin {{ to {{ transform: rotate(360deg); }} }}
+.audio-play-cell {{ display: inline-flex; align-items: center; justify-content: center; }}
+.audio-play-cell audio {{ display: none; }}
+.audio-play-btn {{
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 28px; height: 28px; padding: 0; border: 1px solid {t['border']};
+  border-radius: 50%; background: {t['accent_soft']}; color: {t['accent']};
+  font-size: 0.72rem; cursor: pointer;
+}}
+.audio-play-btn:hover {{
+  background: {t['accent']}; color: {t['uploader_btn_text']}; border-color: {t['accent']};
+}}
+.audio-play-btn.is-playing {{
+  background: {t['accent']};
+  color: {t['uploader_btn_text']};
+  border-color: {t['accent']};
+}}
+.audio-play-btn--disabled {{ opacity: 0.35; cursor: not-allowed; pointer-events: none; }}
+"""
+
+
+def render_audio_play_component(
+    data: bytes,
+    mime: str,
+    element_id: str,
+    theme: str,
+) -> None:
+    """Play button that works in Streamlit (runs inside components.html where JS is allowed)."""
     import streamlit.components.v1 as components
 
+    t = THEME_TOKENS.get(theme, THEME_TOKENS["dark"])
+    safe_id = re.sub(r"[^a-zA-Z0-9_-]", "_", element_id)
+    if len(data) > MAX_INLINE_AUDIO_BYTES:
+        components.html(
+            f'<p style="margin:0;color:{t["text_muted"]};font-size:0.85rem;">'
+            "Recording too large for inline preview (over 8 MB).</p>",
+            height=36,
+        )
+        return
+
+    b64 = base64.b64encode(data).decode("ascii")
+    safe_mime = html_module.escape(mime or "audio/mpeg")
+    audio_dom_id = f"aud-{safe_id}"
     components.html(
-        """
-        <script>
-        (function () {
-          const doc = window.parent.document;
-          const wrap = doc.querySelector(".data-table-wrap.queue-table-scroll");
-          const row = doc.getElementById("queue-row-processing");
-          if (!wrap || !row) return;
-          const offset = row.offsetTop - wrap.offsetTop - (wrap.clientHeight / 2) + (row.clientHeight / 2);
-          wrap.scrollTop = Math.max(0, offset);
-        })();
-        </script>
+        f"""
+        <style>{_queue_iframe_css(t)}</style>
+        {_AUDIO_TOGGLE_SCRIPT}
+        <span class="audio-play-cell">
+          <audio id="{audio_dom_id}" preload="none" src="data:{safe_mime};base64,{b64}"></audio>
+          <button type="button" class="audio-play-btn" data-audio-id="{audio_dom_id}"
+            data-play-icon="▶" data-pause-icon="⏸" title="Play recording"
+            onclick="toggleCallAudio(this)">▶</button>
+        </span>
         """,
-        height=0,
+        height=44,
     )
+
+
+def render_queue_table_component(
+    rows: list[Dict[str, Any]],
+    theme: str,
+    *,
+    max_height_px: int = 280,
+) -> None:
+    """Queue table with working ▶ play buttons (Streamlit blocks onclick in st.markdown)."""
+    import streamlit.components.v1 as components
+
+    t = THEME_TOKENS.get(theme, THEME_TOKENS["dark"])
+    body_rows: list[str] = []
+    has_processing = False
+
+    for row in rows:
+        status = str(row.get("status", "ready"))
+        if status == "processing":
+            has_processing = True
+        tr_attrs = ""
+        if status == "processing":
+            tr_attrs = ' class="row-processing" id="queue-row-processing"'
+        elif status:
+            tr_attrs = f' class="row-{html_module.escape(status)}"'
+
+        aid = audio_element_id("queue", str(row["name"]), int(row["sr"]))
+        play_html = audio_play_button_html(
+            aid, row["data"], str(row.get("mime", "audio/mpeg"))
+        )
+        body_rows.append(
+            f"<tr{tr_attrs}>"
+            f'<td class="col-sr">{int(row["sr"])}</td>'
+            f'<td class="col-play">{play_html}</td>'
+            f'<td class="col-indicator">{file_status_indicator_html(status)}</td>'
+            f"<td>{html_module.escape(str(row['name']))}</td>"
+            f"<td>{html_module.escape(str(row['duration']))}</td>"
+            f"<td>{html_module.escape(str(row['size']))}</td>"
+            f"<td>{html_module.escape(str(row['date']))}</td>"
+            f"<td>{file_status_label_html(status)}</td>"
+            f"</tr>"
+        )
+
+    scroll_script = ""
+    if has_processing:
+        scroll_script = """
+<script>
+(function () {
+  const wrap = document.querySelector(".queue-table-scroll");
+  const row = document.getElementById("queue-row-processing");
+  if (!wrap || !row) return;
+  const offset = row.offsetTop - wrap.offsetTop - (wrap.clientHeight / 2) + (row.clientHeight / 2);
+  wrap.scrollTop = Math.max(0, offset);
+})();
+</script>
+"""
+
+    table_html = f"""
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><style>{_queue_iframe_css(t)}</style></head>
+<body>
+  <div class="data-table-wrap queue-table-scroll" style="max-height:{max_height_px}px;">
+    <table class="data-table">
+      <thead><tr>
+        <th class="col-sr">Sr.</th>
+        <th class="col-play">▶</th>
+        <th class="col-indicator"></th>
+        <th>Recording file</th>
+        <th>Estimated duration</th>
+        <th>Size</th>
+        <th>Date</th>
+        <th>Status</th>
+      </tr></thead>
+      <tbody>{"".join(body_rows)}</tbody>
+    </table>
+  </div>
+  {_AUDIO_TOGGLE_SCRIPT}
+  {scroll_script}
+</body>
+</html>
+"""
+    components.html(table_html, height=max_height_px + 12, scrolling=False)
 
 
 def render_themed_table(
@@ -1039,13 +1374,20 @@ def render_themed_table(
             return "col-sr"
         if column == "":
             return "col-indicator"
+        if column == "▶":
+            return "col-play"
         return ""
 
     header_cells: list[str] = []
     for col in display_cols:
         css = _col_class(str(col))
         th_class = f' class="{css}"' if css else ""
-        label = "" if col == "" else html_module.escape(str(col))
+        if col == "":
+            label = ""
+        elif col == "▶":
+            label = "▶"
+        else:
+            label = html_module.escape(str(col))
         header_cells.append(f"<th{th_class}>{label}</th>")
     header_html = "".join(header_cells)
 
